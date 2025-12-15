@@ -1,0 +1,80 @@
+import os
+import torch
+import cv2
+import torch.nn as nn
+from torchvision import transforms,models
+import torch.nn.functional as F
+import numpy as np
+from T_work6_20231228_exper2_change_1 import Pyramid_VNet_Transformer
+from functools import partial
+from GFF_pyramid_function_change import RollingGuidanceFilter,double_conv,three_conv
+
+os.environ['CUDA_VISIBLE_DEVICES']='3'
+
+def conv3x3(in_planes, out_planes, stride=1, groups=1,dilation = 1):
+    """3x3 convolution with padding"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                 padding=1, groups=groups, bias=False,dilation=dilation)
+
+class ddnet_new_method_tiny(nn.Module):
+    def __init__(self,inchannel,img_size,dgf_r, dgf_eps):
+        super(ddnet_new_method_tiny, self).__init__()
+        num_category = 2
+
+        groups =1
+
+        self.GPV_transformer = Pyramid_VNet_Transformer(img_size, patch_size=4, num_classes=2, embed_dims=[32, 64, 128, 256], num_heads=[1, 2, 4, 8], mlp_ratios=[8, 8, 4, 4], qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=[2, 2, 2, 2], sr_ratios=[8, 4, 2, 1])#224*224
+        self.gn1 = nn.GroupNorm(3, 3)
+        self.conv2 = conv3x3(inchannel,inchannel, 2, groups)  # stride moved
+        self.conv3 = conv3x3(inchannel, inchannel, 1, groups)  # stride moved
+        self.RGF_pyramid1 = RollingGuidanceFilter(dgf_r, dgf_eps,1)
+        self.RGF_pyramid2 = RollingGuidanceFilter(dgf_r, dgf_eps, 2)
+        self.RGF_pyramid3 = RollingGuidanceFilter(dgf_r, dgf_eps, 3)
+        self.d_c1 = conv3x3(inchannel, inchannel)
+        self.d_c2 = double_conv(inchannel, inchannel)
+        self.d_c3 = three_conv(inchannel, inchannel)
+
+
+    def _upsample(self, x, h, w):
+        return F.interpolate(x, size=(h, w), mode='bilinear', align_corners=True)
+    def forward(self, gray, doppler):
+        # print(f'gray_yuan:{gray.shape}')
+        # print(f'doppler_yuan:{doppler.shape}')
+        im1_g = self.RGF_pyramid1(gray)
+        im2_g = self.RGF_pyramid2(im1_g)
+        im3_g = self.RGF_pyramid3(im2_g)
+        #cu chi du ceng
+        imd_1_g = gray - im1_g
+        imd_2_g = im1_g - im2_g
+        imd_3_g = im2_g - im3_g
+        #xi chi du ceng
+        imB_g = im3_g
+
+        im1_d = self.RGF_pyramid1(doppler)
+        im2_d = self.RGF_pyramid2(im1_d)
+        im3_d = self.RGF_pyramid3(im2_d)
+        # cu chi du ceng
+        imd_1_d = doppler - im1_d
+        imd_2_d = im1_d - im2_d
+        imd_3_d = im2_d - im3_d
+        # xi chi du ceng
+        imB_d = im3_d
+        x = torch.cat([gray, doppler], dim=1)
+        imd_1 = torch.cat([imd_1_g, imd_1_d], dim=1)
+        imd_2 = torch.cat([imd_2_g, imd_2_d], dim=1)
+        imd_3 = torch.cat([imd_3_g, imd_3_d], dim=1)
+        imB = torch.cat([imB_g, imB_d], dim=1)
+        segmen, generator =self.GPV_transformer(x,imd_1,imd_2,imd_3,imB)
+        return segmen, generator
+
+if __name__=='__main__':
+    # print(ddnet(3))
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device('cpu')
+    # print(device)
+    bs = 1
+    data1 = torch.randn(bs, 3, 256, 256).to(device)
+    data2 = torch.randn(bs, 3, 256, 256).to(device)
+    for norm_layer in [nn.BatchNorm2d]:
+        model = ddnet_new_method_tiny_xiaorong4(3,256,3,5e-5).to(device)
+        y,y1 = model(data1,data2)
+        print(f'y:{y1.shape}')
