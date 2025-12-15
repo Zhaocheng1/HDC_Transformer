@@ -1,0 +1,422 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from functools import partial
+import numpy as np
+from scipy import signal
+from scipy import misc
+import os
+from torch.autograd import Variable
+from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from timm.models.registry import register_model
+from timm.models.vision_transformer import _cfg
+from feature_extraction_generation_change_1 import *
+# from feature_extraction import *
+from liner_transformer_unit_change_1 import *
+from torch.nn.modules.batchnorm import _BatchNorm
+import math
+os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+
+#??????????ge??
+class Pyramid_VNet_Transformer(nn.Module):
+    def __init__(self, img_size=256, patch_size=4, in_chans=6, num=3,  num_classes=2, embed_dims=[32, 64, 128, 256],
+                 num_heads=[1, 2, 4, 8], mlp_ratios=[4, 4, 4, 4], qkv_bias=False, qk_scale=None, drop_rate=0.3,
+                 attn_drop_rate=0., drop_path_rate=0., norm_layer=nn.LayerNorm,
+                 depths=[3, 4, 6, 3], sr_ratios=[8, 4, 2, 1]):#depths???????transformer block?
+        super().__init__()
+        self.num_classes = num_classes
+        self.depths = depths
+        self.num = num
+        # patch_embed???
+        self.patch_embed1 = PatchEmbed(img_size=img_size, patch_size=patch_size, in_chans=in_chans,
+                                       embed_dim=embed_dims[0])#512,128
+
+        self.patch_embed2 = PatchEmbed(img_size=img_size // 4, patch_size=2, in_chans=embed_dims[0],
+                                       embed_dim=embed_dims[1])#128,64
+
+        self.patch_embed3 = PatchEmbed(img_size=img_size // 8, patch_size=2, in_chans=embed_dims[1],
+                                       embed_dim=embed_dims[2])#64,32
+
+        self.patch_embed4 = PatchEmbed(img_size=img_size // 16, patch_size=2, in_chans=embed_dims[2],
+                                       embed_dim=embed_dims[3])#32,16
+
+        self.patch_embed_c4 = PatchEmbed(img_size=img_size // 32, patch_size=2, in_chans=embed_dims[3],
+                                         embed_dim=embed_dims[3])  # 32,16
+
+        # decoder_patch_embed???
+        self.patch_embed_1 = PatchEmbed1(img_size=img_size//16, patch_size=1, in_chans=embed_dims[2],
+                                       embed_dim=embed_dims[2])#32
+
+        self.patch_embed_2 = PatchEmbed1(img_size=img_size//8, patch_size=1, in_chans=embed_dims[1],
+                                       embed_dim=embed_dims[1])#16
+
+        self.patch_embed_3 = PatchEmbed1(img_size=img_size//4, patch_size=1, in_chans=embed_dims[0],
+                                       embed_dim=embed_dims[0])#64
+
+        self.patch_embed_4 = PatchEmbed2(img_size=img_size//4, patch_size=1, in_chans=embed_dims[0],
+                                       embed_dim=16)#128
+
+        self.Fea1 = Fea1(in_chans)
+        self.Fea2 = Fea2(in_chans)
+        self.Fea3 = Fea3(in_chans)
+        self.Fea4 = Fea4(in_chans)
+        self.inc = inconv(in_chans, 32)
+        self.down1 = down(32, 64)
+        self.down2 = down(64, 128)
+        self.down3 = down(128, 256)
+
+        # pos_embed#????#suijishengchengdelingjuzhen
+        self.pos_embed1 = nn.Parameter(torch.zeros(1, self.patch_embed1.num_patches, embed_dims[0]))#(1,16384,64)
+        self.pos_drop1 = nn.Dropout(p=drop_rate)#?????????
+        self.pos_embed2 = nn.Parameter(torch.zeros(1, self.patch_embed2.num_patches, embed_dims[1]))#(1,4096,128)
+        self.pos_drop2 = nn.Dropout(p=drop_rate)#?????????
+        self.pos_embed3 = nn.Parameter(torch.zeros(1, self.patch_embed3.num_patches, embed_dims[2]))#(1,1024,320)
+        self.pos_drop3 = nn.Dropout(p=drop_rate)#?????????
+        self.pos_embed4 = nn.Parameter(torch.zeros(1, self.patch_embed4.num_patches, embed_dims[3]))#(1,256,512)
+        self.pos_drop4 = nn.Dropout(p=drop_rate)#?????????
+
+        #decoder_pos_embed#????#suijishengchengdelingjuzhen
+        self.pos_embed_1 = nn.Parameter(torch.zeros(1, self.patch_embed_1.num_patches, embed_dims[2]))  # (1,1024,128)
+        self.pos_drop_1 = nn.Dropout(p=drop_rate)  # ?????????
+        self.pos_embed_2 = nn.Parameter(torch.zeros(1, self.patch_embed_2.num_patches, embed_dims[1]))  # (1,4096,128)
+        self.pos_drop_2 = nn.Dropout(p=drop_rate)  # ?????????
+        self.pos_embed_3 = nn.Parameter(torch.zeros(1, self.patch_embed_3.num_patches, embed_dims[0]))  # (1,1024,320)
+        self.pos_drop_3 = nn.Dropout(p=drop_rate)  # ?????????
+        self.pos_embed_4 = nn.Parameter(torch.zeros(1, self.patch_embed_4.num_patches , 16))  # (1,257,512)
+        self.pos_drop_4 = nn.Dropout(p=drop_rate)  # ?????????
+        self.pos_embed4_1 = nn.Parameter(torch.zeros(1, self.patch_embed_c4.num_patches + 1, embed_dims[3]))  # (1,256,512)
+        self.pos_drop4_1 = nn.Dropout(p=drop_rate)  # ?????????
+        self.pos_embed_5 = nn.Parameter(torch.zeros(1, self.patch_embed_4.num_patches, num))  # (1,257,512)
+        self.pos_drop_5 = nn.Dropout(p=drop_rate)  # ?????????
+
+        self.up4 = nn.ConvTranspose2d(32, 16, kernel_size=2, stride=2)
+        self.up5 = nn.ConvTranspose2d(16, 3, kernel_size=2, stride=2)
+        self.up5_1 = nn.ConvTranspose2d(128, 32, kernel_size=4, stride=4)
+        self.up6_1 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
+        self.up8_1 = nn.ConvTranspose2d(96, 16, kernel_size=2, stride=2)
+        self.up8_2 = nn.ConvTranspose2d(32, 3, kernel_size=2, stride=2)
+        self.conv11 = conv1x1(32, 3)
+        self.conv2_1 = conv1x1(128, 64)
+        self.conv1_1 = conv1x1(64, 32)
+        self.conv1_2 = conv1x1(96, 32)
+        # self.conv_f1 = nn.Conv2d(32, 32, 1, bias=False)
+        # self.conv_f2 = nn.Conv2d(64, 64, 1, 1, bias=False)
+        # self.conv_f3 = nn.Conv2d(128, 128, 1, 1, bias=False)
+        # self.conv_f4 = nn.Conv2d(256, 256, 1, 1, bias=False)
+        # transformer encoder
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule?????????
+                                                                                  # ????1?????????start?end??????step???
+        cur = 0   #update=2
+        self.block1 = nn.ModuleList([Block_method1(
+            dim=embed_dims[0]-12, num_heads=num_heads[0], mlp_ratio=mlp_ratios[0], qkv_bias=qkv_bias, qk_scale=qk_scale,
+            drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[cur + i], norm_layer=norm_layer,
+            sr_ratio=sr_ratios[0],layer=3,group=8)
+            for i in range(depths[0])])#?????
+
+
+        cur += depths[0]#cur=2
+        self.block2 = nn.ModuleList([Block_method1(
+            dim=embed_dims[1]-32, num_heads=num_heads[1], mlp_ratio=mlp_ratios[1], qkv_bias=qkv_bias, qk_scale=qk_scale,
+            drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[cur + i], norm_layer=norm_layer,
+            sr_ratio=sr_ratios[1],layer=4,group=8)
+            for i in range(depths[1])])#??????
+
+
+        cur += depths[1]#cur=4
+        self.block3 = nn.ModuleList([Block_method1(
+            dim=embed_dims[2]-80, num_heads=num_heads[2], mlp_ratio=mlp_ratios[2], qkv_bias=qkv_bias, qk_scale=qk_scale,
+            drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[cur + i], norm_layer=norm_layer,
+            sr_ratio=sr_ratios[2],layer=5,group=8)
+            for i in range(depths[2])])#??????
+
+
+        cur += depths[2]#cur=6
+        self.block4 = nn.ModuleList([Block_method1(
+            dim=embed_dims[3]-192, num_heads=num_heads[3], mlp_ratio=mlp_ratios[3], qkv_bias=qkv_bias, qk_scale=qk_scale,
+            drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[cur + i], norm_layer=norm_layer,
+            sr_ratio=sr_ratios[3],layer=6,group=8)
+            for i in range(depths[3])])#??????
+        self.block4_c = nn.ModuleList([Block_method2_s(
+            dim=embed_dims[3], dim1=embed_dims[3], dim2=embed_dims[3], num_heads=num_heads[3], mlp_ratio=mlp_ratios[3],
+            qkv_bias=qkv_bias, qk_scale=qk_scale,
+            drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[cur + i], norm_layer=norm_layer,
+            sr_ratio=sr_ratios[3], layer=6, group=8)
+            for i in range(depths[3])])  # ??????
+
+        self.norm = norm_layer(embed_dims[3])#?????????????
+       #decoder
+        cur_1 = 0  # update=2
+        self.block_1 = nn.ModuleList([Block_method2(
+            dim=embed_dims[2]-80, dim1=embed_dims[3],dim2=80,num_heads=num_heads[3], mlp_ratio=mlp_ratios[3], qkv_bias=qkv_bias, qk_scale=qk_scale,
+            drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[cur_1 + i], norm_layer=norm_layer,
+            sr_ratio=sr_ratios[3],layer=5,group=8)
+            for i in range(depths[3])])  # ?????
+
+        cur_1 += depths[3]  # cur=2
+        self.block_21 = Block_method2(
+            dim=embed_dims[1]-32, dim1=embed_dims[2], dim2 = 32, num_heads=num_heads[2], mlp_ratio=mlp_ratios[2], qkv_bias=qkv_bias, qk_scale=qk_scale,
+            drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[cur_1], norm_layer=norm_layer,
+            sr_ratio=sr_ratios[2], layer=4, group=8)
+
+        self.block_2 = nn.ModuleList([Block_method2(
+            dim=embed_dims[1]-32, dim1=embed_dims[2],dim2=32,num_heads=num_heads[2], mlp_ratio=mlp_ratios[2], qkv_bias=qkv_bias, qk_scale=qk_scale,
+            drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[cur_1 + i], norm_layer=norm_layer,
+            sr_ratio=sr_ratios[2],layer=4,group=8)
+            for i in range(depths[2])])  # ??????
+
+        cur_1 += depths[2]  # cur=4
+        self.block_31 = Block_method2(
+            dim=embed_dims[0]-12, dim1=embed_dims[1],dim2=12,num_heads=num_heads[1], mlp_ratio=mlp_ratios[1], qkv_bias=qkv_bias, qk_scale=qk_scale,
+            drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[cur_1], norm_layer=norm_layer,
+            sr_ratio=sr_ratios[1], layer=3, group=8)
+
+        self.block_3 = nn.ModuleList([Block_method2(
+            dim=embed_dims[0]-12, dim1=embed_dims[1],dim2=12,num_heads=num_heads[1], mlp_ratio=mlp_ratios[1], qkv_bias=qkv_bias, qk_scale=qk_scale,
+            drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[cur_1 + i], norm_layer=norm_layer,
+            sr_ratio=sr_ratios[1],layer=3,group=8)
+            for i in range(depths[1])])  # ??????
+
+        cur_1 += depths[1]  # cur=6
+        self.block_4 = nn.ModuleList([Block_method2_s(
+            dim=16, dim1=16, dim2=16,num_heads=num_heads[1], mlp_ratio=mlp_ratios[0], qkv_bias=qkv_bias, qk_scale=qk_scale,
+            drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[cur_1 + i], norm_layer=norm_layer,
+            sr_ratio=sr_ratios[0])
+            for i in range(depths[0])])  # ??????
+
+
+        self.norm = norm_layer(embed_dims[3])  # ?????????????
+        self.norm1 = norm_layer(num)
+        self.do = nn.Dropout2d(0.3)
+        # # classification head
+        self.head = nn.Linear(embed_dims[3], num_classes) if num_classes > 0 else nn.Identity()  # ???????????
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dims[3]))  # ????PVT??????????????vit?????????(1,1,512)
+
+        # init weights????????
+        trunc_normal_(self.pos_embed1, std=.02)
+        trunc_normal_(self.pos_embed2, std=.02)
+        trunc_normal_(self.pos_embed3, std=.02)
+        trunc_normal_(self.pos_embed4, std=.02)
+        trunc_normal_(self.pos_embed_1, std=.02)
+        trunc_normal_(self.pos_embed_2, std=.02)
+        trunc_normal_(self.pos_embed_3, std=.02)
+        trunc_normal_(self.pos_embed_4, std=.02)
+        self.apply(self._init_weights)#?????
+
+    def reset_drop_path(self, drop_path_rate):#????drop????????????drop_path??
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(self.depths))] #stochastic depth decay rule?????????
+                                                                                  # ????1?????????start?end??????step???
+        cur = 0
+        for i in range(self.depths[0]):#????
+            self.block1[i].drop_path.drop_prob = dpr[cur + i]
+
+        cur += self.depths[0]
+        for i in range(self.depths[1]):#????
+            self.block2[i].drop_path.drop_prob = dpr[cur + i]
+
+        cur += self.depths[1]
+        for i in range(self.depths[2]):#????
+            self.block3[i].drop_path.drop_prob = dpr[cur + i]
+
+        cur += self.depths[2]
+        for i in range(self.depths[3]):#????
+            self.block4[i].drop_path.drop_prob = dpr[cur + i]
+
+    def _init_weights(self, m):#????????
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        # return {'pos_embed', 'cls_token'} # has pos_embed may be better
+        return {'cls_token'}
+
+    def get_classifier(self):
+        return self.head
+
+    # def reset_classifier(self, num_classes, global_pool=''):#??????
+    #     self.num_classes = num_classes
+    #     self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+
+    def forward_features(self, x1,imd_1,imd_2,imd_3,im_B):#(1,3,512,512)
+        B = x1.shape[0]#B?#B=1
+        # print(f'x1_yuan:{x1.shape}')
+        x_d1, x_j1 = self.Fea1(imd_1)  # shape([1,64,224,224])
+        x_d1 = self.do(x_d1)
+        x_j1 = self.do(x_j1)
+
+        # print(f'x_d1:{x_d1.shape}')
+        # print(f'x_j1:{x_j1.shape}')
+        x_d1 = x_d1.flatten(2).transpose(1, 2)
+        x_d2, x_j2 = self.Fea2(imd_2)  # LL shape([1,128,112,112]
+        x_d2 = self.do(x_d2)
+        x_j2 = self.do(x_j2)
+        # print(f'x_d2:{x_d2.shape}')
+        # print(f'x_j2:{x_j2.shape}')
+        x_d2 = x_d2.flatten(2).transpose(1, 2)
+        x_d3, x_j3 = self.Fea3(imd_3)  # LL shape([1,256,56,56])
+        x_d3 = self.do(x_d3)
+        x_j3 = self.do(x_j3)
+        # print(f'x_d3:{x_d3.shape}')
+        # print(f'x_j3:{x_j3.shape}')
+        x_d3 = x_d3.flatten(2).transpose(1, 2)
+        x_b4,x_j4 = self.Fea4(im_B)  # LL shape([1,512,28,28])
+        x_b4 = self.do(x_b4)
+        x_j4 = self.do(x_j4)
+        # print(f'x_b4:{x_b4.shape}')
+        # print(f'x_j4:{x_j4.shape}')
+        x_b4 = x_b4.flatten(2).transpose(1, 2)
+        x_J = x_j1 + x_j2 + x_j3 + x_j4
+        # print(f'x_J:{x_J.shape}')
+
+
+        # stage 1
+
+        x1, (H, W) = self.patch_embed1(x1)#???????(1,16384,32),(128,128)
+        x1 = x1 + self.pos_embed1#????????juedui????
+        x1 = self.pos_drop1(x1)#?????????drop_out??????(1,16384,32,
+        for blk in self.block1:
+            x_z1 = blk(x1,x_d1, H, W)#(1,16384,32),
+        x_z1 = x_z1.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()#(1,32,128,128)
+        # x_z1 = self.conv_f1(x_z1)
+        # print(x1.shape)
+
+        # stage 2?????transformer??
+        x2, (H, W) = self.patch_embed2(x_z1)#(1,4096,64)
+        x2 = x2 + self.pos_embed2#(1,4096,64)
+        x2 = self.pos_drop2(x2)#(1,4096,64)
+        for blk in self.block2:
+            x_z2 = blk(x2, x_d2, H, W)#(1,4096,64)
+        x_z2 = x_z2.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()#(1,64,64,64)
+        # x_z2 = self.conv_f2(x_z2)
+        # print(x2.shape)
+
+        # stage 3??????transformer??
+        x3, (H, W) = self.patch_embed3(x_z2)#(1,1024,128)
+        x3 = x3 + self.pos_embed3#(1,1024,128)
+        x3 = self.pos_drop3(x3)#(1,1024,128)
+        for blk in self.block3:
+            x_z3 = blk(x3, x_d3, H, W)#(1,1024,128)
+        x_z3 = x_z3.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()#(1,128,32,32)
+        # x_z3 = self.conv_f3(x_z3)
+        # print(x3.shape)
+
+        # stage 4??????transformer?????????????
+        x4, (H, W) = self.patch_embed4(x_z3)#(1,256,256)
+        x4 = x4 + self.pos_embed4#?????????????transformer block?????(1,256,256)
+        x4 = self.pos_drop4(x4)#(1,256,256)
+        for blk in self.block4:
+            x_z4 = blk(x4,x_b4, H, W)#(1,256,512)
+        x_z4 = x_z4.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()  # (1,256,16,16)
+        # x_z4 = self.conv_f4(x_z4)
+        # print(x4.shape)
+
+        x_4_cls, (H, W) = self.patch_embed_c4(x_z4)  # 1,16,256#4,4
+        cls_tokens = self.cls_token.expand(B, -1, -1)  # ???(1,1,256)
+        x_4_cls = torch.cat((cls_tokens, x_4_cls), dim=1)  # ??????1,17,256
+        x_4_cls = x_4_cls + self.pos_embed4_1  # 1,17,256
+        x_4_cls = self.pos_drop4_1(x_4_cls)
+        # print(x_4_cls.shape)  # 1,256,8,8
+        for blk in self.block4_c:
+            x_4_cls = blk(x_4_cls, H, W)
+            # print(x_4_cls.shape)
+        x_4_cls = self.norm(x_4_cls)
+        # print(x_4_cls.shape)
+
+        return x_4_cls[:, 0], x_J
+
+    def forward(self, x1, x2, x3, x4, x5):
+        x_f, x_J = self.forward_features(x1, x2, x3, x4, x5)  # ??????????x????????????#(1,512)
+        # x = self.head(x)#????#(1,1000)
+        x_cls = self.head(x_f)  # ????#(1,1000)
+
+        return x_cls, x_J
+
+
+def _conv_filter(state_dict, patch_size=16):#????+??????????
+    """ convert patch embedding weight from manual patchify + linear proj to conv"""
+    out_dict = {}
+    for k, v in state_dict.items():
+        if 'patch_embed.proj.weight' in k:
+            v = v.reshape((v.shape[0], 3, patch_size, patch_size))
+        out_dict[k] = v
+
+    return out_dict
+
+
+@register_model
+def pvt_tiny(pretrained=False, **kwargs):
+    model = Pyramid_VNet_Transformer(
+        patch_size=4, embed_dims=[64, 128, 320, 512], num_heads=[1, 2, 5, 8], mlp_ratios=[8, 8, 4, 4], qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=[2, 2, 2, 2], sr_ratios=[8, 4, 2, 1],
+        **kwargs)
+    model.default_cfg = _cfg()
+
+    return model
+
+
+@register_model
+def pvt_small(pretrained=False, **kwargs):
+    model = Pyramid_VNet_Transformer(
+        patch_size=4, embed_dims=[64, 128, 320, 512], num_heads=[1, 2, 5, 8], mlp_ratios=[8, 8, 4, 4], qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=[3, 4, 6, 3], sr_ratios=[8, 4, 2, 1], **kwargs)
+    model.default_cfg = _cfg()
+
+    return model
+
+
+@register_model
+def pvt_medium(pretrained=False, **kwargs):
+    model = Pyramid_VNet_Transformer(
+        patch_size=4, embed_dims=[64, 128, 320, 512], num_heads=[1, 2, 5, 8], mlp_ratios=[8, 8, 4, 4], qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=[3, 4, 18, 3], sr_ratios=[8, 4, 2, 1],
+        **kwargs)
+    model.default_cfg = _cfg()
+
+    return model
+
+
+@register_model
+def pvt_large(pretrained=False, **kwargs):
+    model = Pyramid_VNet_Transformer(
+        patch_size=4, embed_dims=[64, 128, 320, 512], num_heads=[1, 2, 5, 8], mlp_ratios=[8, 8, 4, 4], qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=[3, 8, 27, 3], sr_ratios=[8, 4, 2, 1],
+        **kwargs)
+    model.default_cfg = _cfg()
+
+    return model
+
+
+@register_model
+def pvt_huge_v2(pretrained=False, **kwargs):
+    model = Pyramid_VNet_Transformer(
+        patch_size=4, embed_dims=[128, 256, 512, 768], num_heads=[2, 4, 8, 12], mlp_ratios=[8, 8, 4, 4], qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=[3, 10, 60, 3], sr_ratios=[8, 4, 2, 1],
+        # drop_rate=0.0, drop_path_rate=0.02)
+        **kwargs)
+    model.default_cfg = _cfg()
+
+    return model
+
+
+if __name__=='__main__':
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    bs = 1
+    data1 = torch.randn(bs, 6, 256, 256).to(device)
+    data2 = torch.randn(bs, 6, 256, 256).to(device)
+    data3 = torch.randn(bs, 6, 256, 256).to(device)
+    data4 = torch.randn(bs, 6, 256, 256).to(device)
+    data5 = torch.randn(bs, 6, 256, 256).to(device)
+    for norm_layer in [nn.BatchNorm2d]:
+        model = Pyramid_VNet_Transformer( patch_size=4, embed_dims=[32, 64, 128, 256], num_heads=[1, 2, 4, 8], mlp_ratios=[8, 8, 4, 4], qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=[2, 2, 2, 2], sr_ratios=[8, 4, 2, 1]).to(device)
+        a1,a2= model(data1,data2, data3, data4,data5)
+        # model = sa_layer(256).to(device)
+        # y1,y2,y3,y4 = model(data)
+        print(f'y:{a1.shape}')#[1,1000]
+
+
