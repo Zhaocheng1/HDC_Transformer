@@ -1,0 +1,23 @@
+import torch
+import torch.nn as nn
+import torchvision
+import os
+
+from T_model1.resnet import resnet50, resnet34, resnet18
+from ddnet_work6_20231228_exper2_change import ddnet_new_method_tiny
+
+
+def get_model(args):
+
+    encoder = {
+        "resnet50": resnet50(num_classes=2),
+        "resnet34": resnet34(num_classes=2),
+        "resnet18": resnet18(num_classes=2),
+        "ddnet_new_method_tiny": ddnet_new_method_tiny(3, args.img_size, dgf_r=3, dgf_eps=5e-5)
+
+    }
+
+    if args.model_name not in encoder.keys():
+        raise KeyError(f"{args.model_name} is not a valid model version")
+    print('Use model:{}'.format(args.model_name))
+    return encoder[args.model_name]
