@@ -1,0 +1,280 @@
+from __future__ import print_function
+
+import timeit
+from torchnet import meter
+# from torchtnt import meter
+import argparse
+import random
+import logging
+from sklearn.metrics import confusion_matrix
+from torch.optim import lr_scheduler
+from torchvision import transforms
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+import os
+import time
+import torch
+import torch.optim as optim
+import numpy as np
+from Data.load_data import ToTensor, Normalize, Cardiac_dataset, VSD_dataset
+from torch.nn import CrossEntropyLoss
+from units import split_flods, metrics_test,metrics_test1, trainlog
+from T_model1.model_list import get_model
+import torch.nn as nn
+import torch.nn.functional as F
+from Loss import Loss
+
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+# DEVICE = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--seed', type=int, default=42, help='Random seed.')
+parser.add_argument('--model_name', type=str, default="ddnet_new_method_tiny_xiaorong_rgf_10", help='name of Model.')
+parser.add_argument('--batch_size', type=int, default=16, help='Number of bachsize.')
+parser.add_argument('--epochs', type=int, default=15, help='Number of epochs to train.')
+parser.add_argument('--lr', type=float, default=2e-4, help='Initial learning rate.')
+parser.add_argument('--img_size', type=int, default=256, help='shape of image.')
+parser.add_argument('--flods', type=int, default=5, help='The number of folds for the crossover experiment')
+parser.add_argument('--repeat_num', type=int, default=5, help='number of randomized experiments')
+parser.add_argument('--interval', type=int, default=1, help='Iterates over the displayed spacing')
+parser.add_argument('--evaluationFrq', type=int, default=1, help='every evaluationFrq epoch to do a evaluation')
+parser.add_argument('--logfile_path', type=str, default='log', help='The path where the logs are stored')
+parser.add_argument('--loss_function', type=str, default='focal+ce', help='function')
+parser.add_argument('--f_c', type=str, default='focal+ce_main_f21', help='function')
+args = parser.parse_args()
+random.seed(args.seed)
+np.random.seed(args.seed)
+torch.manual_seed(args.seed)
+
+
+def image_similarity_vectors_via_numpy(feature1, feature2):
+    # ??feature1?N*C*W*H? feature2??N*C*W*H???????tensor?????
+    feature1 = feature1.view(feature1.shape[0], -1)  # ??????N*(C*W*H)????
+    feature2 = feature2.view(feature2.shape[0], -1)
+    feature1 = F.normalize(feature1)  # F.normalize??????????L2???
+    feature2 = F.normalize(feature2)
+    res = feature1.mm(feature2.t())  # ???????
+    return res
+class GradientCalculator(nn.Module):
+    def __init__(self,inchannel=6):
+        super(GradientCalculator, self).__init__()
+        w1 = torch.Tensor(
+            np.array([[0.,1.,0.],[1.,-4.,1.],[0.,1.,0.]]).reshape(1, 1, 3,3))  # (1,1,3,3,)
+        self.conv0 = nn.Conv2d(inchannel,inchannel, 3, 1,padding=1,groups=inchannel,bias = False)
+        self.conv0.weight = nn.Parameter(w1.repeat(inchannel,1,1,1))
+
+    def forward(self, x):
+        x = self.conv0(x)
+        return x
+
+def validate(val_loader, model, criterion,criterion_GAN,criterion1):
+    # switch to evaluate mode
+    model.eval()
+    val_loss_meter = meter.AverageValueMeter()
+    val_loss_meter.reset()
+    val_loss = 0.
+    val_corrects = 0.
+    val_total = 0.
+    pred = []
+    true = []
+    val_data = tqdm(enumerate(val_loader), total=len(val_loader), disable=True)
+    with torch.no_grad():
+        for i, sample_batch in val_data:
+            gray_val = sample_batch['gray'].cuda()
+            doppler_val = sample_batch['doppler'].cuda()
+            label_val = sample_batch['label'].cuda()
+            # label_val = label_val.cuda().float()
+            gradient_calculator = GradientCalculator().cuda()
+            batchsize = gray_val.size(0)
+            outputs,_ = model(gray_val, doppler_val)
+            if isinstance(outputs, list):
+                loss_list = [criterion1(F.log_softmax(o, dim=1), label_val.long()) / len(outputs) for o in outputs]
+                loss1 = sum(loss_list)
+            else:
+                outputs = F.log_softmax(outputs, dim=1)
+                loss1 = criterion1(outputs, label_val.long())
+            outputs = F.log_softmax(outputs, dim=1)
+            loss2 = criterion(outputs, label_val.long())
+            # pre_sobel, label_sobel = sobel_compute.compute_edges(outputs, label1.float())
+            # sobel_loss = F.l1_loss(pre_sobel, label_sobel)
+            # x_val = torch.cat([gray_val, doppler_val], dim=1)
+            # loss_re_g = criterion_GAN(gradient_calculator(generator),
+            #                           gradient_calculator(x_val)).mean()  # computer grad
+            # loss_re_r = criterion_GAN(generator, x_val).mean()  # computer cont
+            # loss_ssim_1 = image_similarity_vectors_via_numpy(generator, x_val)
+            # loss_ssim = (1 - loss_ssim_1).mean()
+            # loss_generator = loss_re_g + loss_re_r + loss_ssim
+            loss = loss1 + 0.1*loss2
+            # loss = loss1 + 0.0001 * loss_generator
+
+
+            val_loss_meter.add(loss.cpu().data)
+
+            if isinstance(outputs, list):
+                label_pred = outputs[0].data.max(1)[1].cpu().numpy()
+            else:
+                label_pred = outputs.data.max(1)[1].cpu().numpy()
+
+            label_true = label_val.cpu().data.numpy()
+            pred.extend(label_pred)
+            true.extend(label_true)
+
+            if isinstance(outputs, list):
+                _, preds = torch.max(outputs[0], 1)
+            else:
+                _, preds = torch.max(outputs, 1)
+
+            correct = torch.sum(preds.data == label_val.data)
+            val_corrects += correct
+            val_loss += loss.item()
+            val_total += batchsize
+    confusionMatrix = confusion_matrix(true, pred).ravel()
+    accuracy = float(val_corrects) / val_total
+    val_loss = val_loss / len(val_loader)
+    return val_loss, accuracy, confusionMatrix
+
+
+def train(model, train_loader, optimizer, scheduler, val_loader, epoch, criterion, criterion_GAN,criterion1):
+    global val_acc, confusionMatrix
+    loss_meter = meter.AverageValueMeter()  # Record the mean and variance of the loss function
+    loss_meter.reset()
+    model.train(True)
+    total = 0.0
+    train_correct = 0.0
+    train_loss = 0.0
+    train_data = tqdm(enumerate(train_loader), total=len(train_loader), disable=True)
+    for i, sample_batch in train_data:
+        gray = sample_batch['gray'].cuda()
+        doppler = sample_batch['doppler'].cuda()
+        label = sample_batch['label'].cuda()
+        gradient_calculator = GradientCalculator().cuda()
+        batch_size = gray.size(0)
+        optimizer.zero_grad()
+        outputs,_ = model(gray, doppler)
+        if isinstance(outputs, list):
+            loss_list = [criterion1(F.log_softmax(o, dim=1), label.long()) / len(outputs) for o in outputs]
+            loss1 = sum(loss_list)
+        else:
+            outputs = F.log_softmax(outputs, dim=1)
+            loss1 = criterion1(outputs, label.long())
+        outputs = F.log_softmax(outputs, dim=1)
+        loss2 = criterion(outputs, label.long())
+        # x = torch.cat([gray, doppler], dim=1)
+        # print(generator.shape)
+        # print(x.shape)
+        # loss_re_g = criterion_GAN(gradient_calculator(generator), gradient_calculator(x)).mean()  # computer grad
+        # loss_re_r = criterion_GAN(generator, x).mean()  # computer cont
+        # loss_ssim_1 = image_similarity_vectors_via_numpy(generator, x)
+        # loss_ssim = (1 - loss_ssim_1).mean()
+        # loss_generator = loss_re_g + loss_re_r + loss_ssim
+        loss  = loss1 + 0.1*loss2
+        # loss = loss1 + 0.0001 * loss_generator
+        #
+        loss.backward()
+        optimizer.step()
+        loss_meter.add(loss.cpu().data)
+        if (i + 1) % args.interval == 0:
+            print("Training:Epoch[{:0>3}/{:0>3}] Iteration[{:0>3}/{:0>3}] train_loss: {:.4f}".format(
+                epoch + 1,
+                args.epochs,
+                i, len(
+                    train_loader), loss_meter.value()[0]))
+        scheduler.step()
+
+        if isinstance(outputs, list):
+            _, preds = torch.max(outputs[0], 1)
+        else:
+            _, preds = torch.max(outputs, 1)
+
+        correct = torch.sum(preds.data == label.data)
+        total += batch_size
+        train_correct += correct
+        train_loss += loss.item()
+
+    train_acc = float(train_correct) / total
+    average_loss = train_loss / len(train_loader)
+    train_data.close()
+    if epoch % args.evaluationFrq == 0:
+        val_loss, val_acc, confusionMatrix = validate(val_loader, model, criterion,criterion_GAN,criterion1)
+        print('Validation:Epoch[{:0>3}/{:0>3}]'.format(epoch + 1, args.epochs), ' val_loss: %.4f' % val_loss,
+              'val_acc: %.4f' % val_acc)
+        logging.info('Epoch [%d/%d] lr:%s train_loss:%.3f train_acc:%.3f val_loss:%.3f val_acc:%.3f' % (
+            epoch + 1, args.epochs, scheduler.get_last_lr(), average_loss, train_acc, val_loss, val_acc))
+    return val_acc, confusionMatrix
+
+
+def main(train_date):
+    global best_model_path
+    """????"""
+    """???????????tensor"""
+    transforms_train = transforms.Compose([ToTensor(),
+                                           Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+    transforms_val = transforms.Compose([ToTensor(),
+                                         Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+    transforms_test = transforms.Compose([ToTensor(),
+                                          Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+
+    # dir_path = f'/home/zhaocheng/train_work6_3/multi_model_class/2023_0811_VSD_jian/Data/VSD_label_Train{args.flods}_folds.csv'  # ?????????????
+    dir_path = f'/home/zhaocheng/train_work6_3/multi_model_class/2023_0811_VSD_jian/Data/VSD_label_RVOT_Train{args.flods}_folds.csv'  # ?????????????
+
+    for fold in range(1, args.repeat_num + 1):
+        best_acc = 0.0
+        train_fold, val_fold = split_flods(flod=fold, k=args.flods)
+
+        train_data = VSD_dataset(type='train', trsf=transforms_train, img_size=args.img_size, fold=train_fold,
+                                     path=dir_path)
+        val_data = VSD_dataset(type='val', trsf=transforms_val, img_size=args.img_size, fold=val_fold,
+                                   path=dir_path)
+        test_data = VSD_dataset(type='test', trsf=transforms_test, img_size=args.img_size,
+                                    path='/home/zhaocheng/train_work6_3/multi_model_class/2023_0811_VSD_jian/Data/VSD_label_RVOT_test.csv')
+
+        train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=16)
+        val_loader = DataLoader(val_data, batch_size=args.batch_size, shuffle=False, num_workers=16)
+        test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False, num_workers=16)
+
+        """????"""
+        model = get_model(args)
+        model.cuda()
+        # model.to(DEVICE)
+        # criterion = CrossEntropyLoss()
+        criterion = nn.NLLLoss(ignore_index=255)
+        criterion_GAN = nn.MSELoss()
+        criterion1 = Loss('Focal')
+        # optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.99)
+        optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=(0.99, 0.999))
+        exp_lr_scheduler = lr_scheduler.StepLR(optimizer, step_size=1796, gamma=0.9)
+        start = timeit.default_timer()  # start timer
+        logging.info('Experiment [%d/%d]' % (fold, args.repeat_num))
+        for epoch in range(args.epochs):
+            print('Experiment [%d/%d] Epoch [%d/%d]' % (fold, args.repeat_num, epoch + 1, args.epochs))
+            acc_val, confusion = train(model, train_loader, optimizer, exp_lr_scheduler, val_loader, epoch, criterion, criterion_GAN,criterion1)
+            if acc_val > best_acc:
+                best_acc = acc_val
+                best_model_path = 'best_model/%s_%s_%d.pt' % (train_date, args.model_name, fold)
+                torch.save(model.state_dict(), best_model_path)
+                logging.info('saved best model to %s' % best_model_path)
+                logging.info('the validation confusion matrixis(tn, fp, fn, tp): %d, %d, %d, %d' % (confusion[0],
+                                                                                    confusion[1],
+                                                                                    confusion[2],
+                                                                                    confusion[3]))
+        end = timeit.default_timer()
+        logging.info('Experiment%d The best val_acc: %.4f' % (fold, best_acc))
+        logging.info('Finish one epoch, run {:.2f} seconds'.format(end - start))
+        logging.info('--' * 30)
+
+        """???????????"""
+        metrics_test(test_loader, args, train_date, best_model_path, fold)
+        print("end---")
+
+
+if __name__ == '__main__':
+    # ?????
+    timeInfo = time.strftime("%Y_%m_%d_%H_%M", time.localtime())  # ???????
+    logfile = '{}/{}_{}.log'.format(args.logfile_path, timeInfo, args.model_name)
+    trainlog(logfile)
+    # ????
+    for param in sorted(vars(args).keys()):
+        logging.info('--{0} {1}'.format(param, vars(args)[param]))
+    logging.info('--' * 30)
+    main(timeInfo)
